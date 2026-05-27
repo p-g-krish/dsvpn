@@ -32,9 +32,11 @@ typedef struct Context_ {
     int           tun_fd;
     int           client_fd;
     int           listen_fd;
-    int           congestion;
     int           firewall_rules_set;
     Buf           client_buf;
+    Buf           tx_buf;
+    size_t        tx_off;
+    size_t        tx_len;
     struct pollfd fds[3];
     uint32_t      uc_kx_st[12];
     uint32_t      uc_st[2][12];
@@ -172,6 +174,8 @@ static void client_disconnect(Context *context)
     (void) close(context->client_fd);
     context->client_fd          = -1;
     context->fds[POLLFD_CLIENT] = (struct pollfd) { .fd = -1, .events = 0 };
+    context->tx_off             = 0;
+    context->tx_len             = 0;
     memset(context->uc_st, 0, sizeof context->uc_st);
 }
 
@@ -241,7 +245,6 @@ static int tcp_accept(Context *context, int listen_fd)
     getnameinfo((const struct sockaddr *) (const void *) &client_ss, client_ss_len, client_ip,
                 sizeof client_ip, NULL, 0, NI_NUMERICHOST | NI_NUMERICSERV);
     printf("Connection attempt from [%s]\n", client_ip);
-    context->congestion = 0;
     fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL, 0) | O_NONBLOCK);
     if (context->client_fd != -1 &&
         memcmp(context->client_ip, client_ip, sizeof context->client_ip) != 0) {
@@ -317,7 +320,6 @@ static int client_connect(Context *context)
         return -1;
     }
     fcntl(context->client_fd, F_SETFL, fcntl(context->client_fd, F_GETFL, 0) | O_NONBLOCK);
-    context->congestion = 0;
     if (client_key_exchange(context) != 0) {
         fprintf(stderr, "Authentication failed\n");
         client_disconnect(context);
@@ -350,10 +352,32 @@ static int client_reconnect(Context *context)
     return -1;
 }
 
+static int try_tx_drain(Context *context)
+{
+    ssize_t writenb;
+
+    if (context->tx_len == 0 || context->client_fd == -1) {
+        return 0;
+    }
+    writenb = safe_write_partial(context->client_fd, context->tx_buf.len + context->tx_off,
+                                 context->tx_len - context->tx_off);
+    if (writenb < (ssize_t) 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        return -1;
+    }
+    context->tx_off += (size_t) writenb;
+    if (context->tx_off >= context->tx_len) {
+        context->tx_off = 0;
+        context->tx_len = 0;
+    }
+    return 0;
+}
+
 static int event_loop(Context *context)
 {
-    struct pollfd *const fds = context->fds;
-    Buf                  tun_buf;
+    struct pollfd *const fds        = context->fds;
     Buf                 *client_buf = &context->client_buf;
     ssize_t              len;
     int                  found_fds;
@@ -361,6 +385,10 @@ static int event_loop(Context *context)
 
     if (exit_signal_received != 0) {
         return -2;
+    }
+    fds[POLLFD_TUN].events = (context->tx_len == 0) ? POLLIN : 0;
+    if (context->client_fd != -1) {
+        fds[POLLFD_CLIENT].events = POLLIN | (context->tx_len != 0 ? POLLOUT : 0);
     }
     if ((found_fds = poll(fds, POLLFD_COUNT, 1500)) == -1) {
         return errno == EINTR ? 0 : -1;
@@ -377,6 +405,8 @@ static int event_loop(Context *context)
         }
         context->client_fd = new_client_fd;
         client_buf->pos    = 0;
+        context->tx_off    = 0;
+        context->tx_len    = 0;
         memset(client_buf->data, 0, sizeof client_buf->data);
         puts("Session established");
         fds[POLLFD_CLIENT] = (struct pollfd) { .fd = context->client_fd, .events = POLLIN };
@@ -386,35 +416,21 @@ static int event_loop(Context *context)
         return -1;
     }
     if (fds[POLLFD_TUN].revents & POLLIN) {
-        len = tun_read(context->tun_fd, tun_buf.data, sizeof tun_buf.data);
+        len = tun_read(context->tun_fd, context->tx_buf.data, sizeof context->tx_buf.data);
         if (len <= 0) {
             perror("tun_read");
             return -1;
         }
-#ifdef BUFFERBLOAT_CONTROL
-        if (context->congestion) {
-            context->congestion = 0;
-            return 0;
-        }
-#endif
         if (context->client_fd != -1) {
             unsigned char tag_full[16];
-            ssize_t       writenb;
             uint16_t      binlen = endian_swap16((uint16_t) len);
 
-            memcpy(tun_buf.len, &binlen, 2);
-            uc_encrypt(context->uc_st[0], tun_buf.data, len, tag_full);
-            memcpy(tun_buf.tag, tag_full, TAG_LEN);
-            writenb = safe_write_partial(context->client_fd, tun_buf.len, 2U + TAG_LEN + len);
-            if (writenb < (ssize_t) 0) {
-                context->congestion = 1;
-                writenb             = (ssize_t) 0;
-            }
-            if (writenb != (ssize_t) (2U + TAG_LEN + len)) {
-                writenb = safe_write(context->client_fd, tun_buf.len + writenb,
-                                     2U + TAG_LEN + len - writenb, TIMEOUT);
-            }
-            if (writenb < (ssize_t) 0) {
+            memcpy(context->tx_buf.len, &binlen, 2);
+            uc_encrypt(context->uc_st[0], context->tx_buf.data, (size_t) len, tag_full);
+            memcpy(context->tx_buf.tag, tag_full, TAG_LEN);
+            context->tx_off = 0;
+            context->tx_len = 2U + TAG_LEN + (size_t) len;
+            if (try_tx_drain(context) != 0) {
                 perror("Unable to write data to the TCP socket");
                 return client_reconnect(context);
             }
@@ -423,6 +439,12 @@ static int event_loop(Context *context)
     if ((fds[POLLFD_CLIENT].revents & POLLERR) || (fds[POLLFD_CLIENT].revents & POLLHUP)) {
         puts("Client disconnected");
         return client_reconnect(context);
+    }
+    if (fds[POLLFD_CLIENT].revents & POLLOUT) {
+        if (try_tx_drain(context) != 0) {
+            perror("Unable to write data to the TCP socket");
+            return client_reconnect(context);
+        }
     }
     if (fds[POLLFD_CLIENT].revents & POLLIN) {
         uint16_t binlen;

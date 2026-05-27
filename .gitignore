@@ -31,6 +31,7 @@
 *.x86_64
 *~
 .cflags
+.swival/
 .test.c
 .tmp_versions/
 .vscode
