@@ -344,10 +344,11 @@ int tcp_opts(int fd)
     int on = 1;
 
     (void) setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof on);
+#ifdef TCP_NODELAY
+    (void) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &on, sizeof on);
+#endif
 #ifdef TCP_QUICKACK
     (void) setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, (char *) &on, sizeof on);
-#else
-    (void) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &on, sizeof on);
 #endif
 #ifdef TCP_CONGESTION
     (void) setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, OUTER_CONGESTION_CONTROL_ALG,
